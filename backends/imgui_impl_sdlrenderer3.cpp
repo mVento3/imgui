@@ -14,8 +14,9 @@
 //  [X] Renderer: Large meshes support (64k+ vertices) even with 16-bit indices (ImGuiBackendFlags_RendererHasVtxOffset).
 //  [X] Renderer: Texture updates support for dynamic font atlas (ImGuiBackendFlags_RendererHasTextures).
 //  [X] Renderer: Expose selected render state for draw callbacks to use. Access in '(ImGui_ImplXXXX_RenderState*)GetPlatformIO().Renderer_RenderState'.
-// Missing features:
-//  [ ] Renderer: Multi-viewport support (multiple windows).
+//  [X] Renderer: Multi-viewport support (multiple windows).
+//    FIXME: Missing way to share textures betweens renderers: https://github.com/libsdl-org/SDL/issues/6742
+//    FIXME: Missing way to specify a projection matrix, so our vertices in absolute coordinates are not displayed correctly in multi-viewports mode.
 
 // You can copy and use unmodified imgui_impl_* files in your project. See examples/ folder for examples of using this.
 // Prefer including the entire imgui/ repository into your project (either as a copy or as a submodule), and only build the backends you need.
@@ -28,6 +29,7 @@
 // CHANGELOG
 //  2025-06-11: Added support for ImGuiBackendFlags_RendererHasTextures, for dynamic font atlas. Removed ImGui_ImplSDLRenderer3_CreateFontsTexture() and ImGui_ImplSDLRenderer3_DestroyFontsTexture().
 //  2025-01-18: Use endian-dependent RGBA32 texture format, to match SDL_Color.
+//  2024-XX-XX: Platform: Added support for multiple windows via the ImGuiPlatformIO interface. (#5835)
 //  2024-10-09: Expose selected render state in ImGui_ImplSDLRenderer3_RenderState, which you can access in 'void* platform_io.Renderer_RenderState' during draw callbacks.
 //  2024-07-01: Update for SDL3 api changes: SDL_RenderGeometryRaw() uint32 version was removed (SDL#9009).
 //  2024-05-14: *BREAKING CHANGE* ImGui_ImplSDLRenderer3_RenderDrawData() requires SDL_Renderer* passed as parameter.
@@ -57,7 +59,9 @@
 struct ImGui_ImplSDLRenderer3_Data
 {
     SDL_Renderer*           Renderer;       // Main viewport's renderer
-    ImVector<SDL_FColor>    ColorBuffer;
+    SDL_Texture*            FontTexture;
+    ImVector<SDL_FColor>    ColorBuffer;    // Transformed color buffer
+    ImVector<ImVec2>        PosBuffer;      // Transformed pos buffer (for multi-viewports only)
 
     ImGui_ImplSDLRenderer3_Data()   { memset((void*)this, 0, sizeof(*this)); }
 };
@@ -68,6 +72,10 @@ static ImGui_ImplSDLRenderer3_Data* ImGui_ImplSDLRenderer3_GetBackendData()
 {
     return ImGui::GetCurrentContext() ? (ImGui_ImplSDLRenderer3_Data*)ImGui::GetIO().BackendRendererUserData : nullptr;
 }
+
+// Forward Declarations
+static void ImGui_ImplSDLRenderer3_InitMultiViewportSupport();
+static void ImGui_ImplSDLRenderer3_ShutdownMultiViewportSupport();
 
 // Functions
 bool ImGui_ImplSDLRenderer3_Init(SDL_Renderer* renderer)
@@ -83,8 +91,11 @@ bool ImGui_ImplSDLRenderer3_Init(SDL_Renderer* renderer)
     io.BackendRendererName = "imgui_impl_sdlrenderer3";
     io.BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset;  // We can honor the ImDrawCmd::VtxOffset field, allowing for large meshes.
     io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;   // We can honor ImGuiPlatformIO::Textures[] requests during render.
+    io.BackendFlags |= ImGuiBackendFlags_RendererHasViewports;  // We can create multi-viewports on the Renderer side (optional)
 
     bd->Renderer = renderer;
+
+    ImGui_ImplSDLRenderer3_InitMultiViewportSupport();
 
     return true;
 }
@@ -95,11 +106,15 @@ void ImGui_ImplSDLRenderer3_Shutdown()
     IM_ASSERT(bd != nullptr && "No renderer backend to shutdown, or already shutdown?");
     ImGuiIO& io = ImGui::GetIO();
 
+    ImGui_ImplSDLRenderer3_ShutdownMultiViewportSupport();
     ImGui_ImplSDLRenderer3_DestroyDeviceObjects();
 
     io.BackendRendererName = nullptr;
     io.BackendRendererUserData = nullptr;
+  
     io.BackendFlags &= ~(ImGuiBackendFlags_RendererHasVtxOffset | ImGuiBackendFlags_RendererHasTextures);
+    io.BackendFlags &= ~(ImGuiBackendFlags_RendererHasVtxOffset | ImGuiBackendFlags_RendererHasViewports);
+
     IM_DELETE(bd);
 }
 
@@ -225,13 +240,32 @@ void ImGui_ImplSDLRenderer3_RenderDrawData(ImDrawData* draw_data, SDL_Renderer* 
                 SDL_SetRenderClipRect(renderer, &r);
 
                 const float* xy = (const float*)(const void*)((const char*)(vtx_buffer + pcmd->VtxOffset) + offsetof(ImDrawVert, pos));
+                int xy_stride = (int)sizeof(ImDrawVert);
                 const float* uv = (const float*)(const void*)((const char*)(vtx_buffer + pcmd->VtxOffset) + offsetof(ImDrawVert, uv));
                 const SDL_Color* color = (const SDL_Color*)(const void*)((const char*)(vtx_buffer + pcmd->VtxOffset) + offsetof(ImDrawVert, col)); // SDL 2.0.19+
+
+                // FIXME-OPT: Transform position manually
+                // FIXME-OPT: Note that SDL_RenderGeometryRaw() does another transform for colors..
+                if (draw_data->DisplayPos.x != 0.0f || draw_data->DisplayPos.y != 0.0f)
+                {
+                    const float off_x = draw_data->DisplayPos.x;
+                    const float off_y = draw_data->DisplayPos.y;
+                    bd->PosBuffer.resize(pcmd->ElemCount);
+                    const ImDrawVert* p_in = vtx_buffer + pcmd->VtxOffset;
+                    ImVec2* p_out = bd->PosBuffer.Data;
+                    for (int remaining = pcmd->ElemCount; remaining > 0; remaining--, p_out++, p_in++)
+                    {
+                        p_out->x = p_in->pos.x - off_x;
+                        p_out->y = p_in->pos.y - off_y;
+                    }
+                    xy = (const float*)bd->PosBuffer.Data;
+                    xy_stride = (int)sizeof(ImVec2);
+                }
 
                 // Bind texture, Draw
                 SDL_Texture* tex = (SDL_Texture*)pcmd->GetTexID();
                 SDL_RenderGeometryRaw8BitColor(renderer, bd->ColorBuffer, tex,
-                    xy, (int)sizeof(ImDrawVert),
+                    xy, xy_stride,
                     color, (int)sizeof(ImDrawVert),
                     uv, (int)sizeof(ImDrawVert),
                     draw_list->VtxBuffer.Size - pcmd->VtxOffset,
@@ -307,6 +341,78 @@ void ImGui_ImplSDLRenderer3_DestroyDeviceObjects()
             tex->SetStatus(ImTextureStatus_WantDestroy);
             ImGui_ImplSDLRenderer3_UpdateTexture(tex);
         }
+}
+
+//--------------------------------------------------------------------------------------------------------
+// MULTI-VIEWPORT / PLATFORM INTERFACE SUPPORT
+// This is an _advanced_ and _optional_ feature, allowing the backend to create and handle multiple viewports simultaneously.
+// If you are new to dear imgui or creating a new binding for dear imgui, it is recommended that you completely ignore this section first..
+//--------------------------------------------------------------------------------------------------------
+
+// Helper structure we store in the void* RendererUserData field of each ImGuiViewport to easily retrieve our backend data.
+struct ImGui_ImplSDLRenderer3_ViewportData
+{
+    SDL_Renderer*                   Renderer;
+
+    ImGui_ImplSDLRenderer3_ViewportData()   { Renderer = nullptr; }
+    ~ImGui_ImplSDLRenderer3_ViewportData()  { IM_ASSERT(Renderer == nullptr); }
+};
+
+static void ImGui_ImplSDLRenderer3_CreateWindow(ImGuiViewport* viewport)
+{
+    //ImGui_ImplSDLRenderer3_Data* bd = ImGui_ImplSDLRenderer3_GetBackendData();
+    ImGui_ImplSDLRenderer3_ViewportData* vd = IM_NEW(ImGui_ImplSDLRenderer3_ViewportData)();
+    viewport->RendererUserData = vd;
+
+    SDL_WindowID window_id = (SDL_WindowID)(intptr_t)viewport->PlatformHandle;
+    SDL_Window* window = SDL_GetWindowFromID(window_id);
+    vd->Renderer = SDL_CreateRenderer(window, nullptr);
+    SDL_SetRenderVSync(vd->Renderer, 0);
+    IM_ASSERT(vd->Renderer != NULL);
+}
+
+static void ImGui_ImplSDLRenderer3_DestroyWindow(ImGuiViewport* viewport)
+{
+    // The main viewport (owned by the application) will always have RendererUserData == nullptr since we didn't create the data for it.
+    if (ImGui_ImplSDLRenderer3_ViewportData* vd = (ImGui_ImplSDLRenderer3_ViewportData*)viewport->RendererUserData)
+    {
+        SDL_DestroyRenderer(vd->Renderer);
+        vd->Renderer = nullptr;
+        IM_DELETE(vd);
+    }
+    viewport->RendererUserData = nullptr;
+}
+
+static void ImGui_ImplSDLRenderer3_RenderWindow(ImGuiViewport* viewport, void*)
+{
+    ImGui_ImplSDLRenderer3_ViewportData* vd = (ImGui_ImplSDLRenderer3_ViewportData*)viewport->RendererUserData;
+    if (!(viewport->Flags & ImGuiViewportFlags_NoRendererClear))
+    {
+        ImVec4 clear_color = ImVec4(0.0f, 0.0f, 0.0f, 1.0f);
+        SDL_SetRenderDrawColor(vd->Renderer, (Uint8)(clear_color.x * 255), (Uint8)(clear_color.y * 255), (Uint8)(clear_color.z * 255), (Uint8)(clear_color.w * 255));
+        SDL_RenderClear(vd->Renderer);
+    }
+    ImGui_ImplSDLRenderer3_RenderDrawData(viewport->DrawData, vd->Renderer);
+}
+
+static void ImGui_ImplSDLRenderer3_SwapBuffers(ImGuiViewport* viewport, void*)
+{
+    ImGui_ImplSDLRenderer3_ViewportData* vd = (ImGui_ImplSDLRenderer3_ViewportData*)viewport->RendererUserData;
+    SDL_RenderPresent(vd->Renderer);
+}
+
+static void ImGui_ImplSDLRenderer3_InitMultiViewportSupport()
+{
+    ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
+    platform_io.Renderer_CreateWindow = ImGui_ImplSDLRenderer3_CreateWindow;
+    platform_io.Renderer_DestroyWindow = ImGui_ImplSDLRenderer3_DestroyWindow;
+    platform_io.Renderer_RenderWindow = ImGui_ImplSDLRenderer3_RenderWindow;
+    platform_io.Renderer_SwapBuffers = ImGui_ImplSDLRenderer3_SwapBuffers;
+}
+
+static void ImGui_ImplSDLRenderer3_ShutdownMultiViewportSupport()
+{
+    ImGui::DestroyPlatformWindows();
 }
 
 //-----------------------------------------------------------------------------

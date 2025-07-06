@@ -14,8 +14,9 @@
 //  [X] Renderer: Large meshes support (64k+ vertices) even with 16-bit indices (ImGuiBackendFlags_RendererHasVtxOffset).
 //  [X] Renderer: Texture updates support for dynamic font atlas (ImGuiBackendFlags_RendererHasTextures).
 //  [X] Renderer: Expose selected render state for draw callbacks to use. Access in '(ImGui_ImplXXXX_RenderState*)GetPlatformIO().Renderer_RenderState'.
-// Missing features:
-//  [ ] Renderer: Multi-viewport support (multiple windows).
+//  [X] Renderer: Multi-viewport support (multiple windows).
+//    FIXME: Missing way to share textures betweens renderers: https://github.com/libsdl-org/SDL/issues/6742
+//    FIXME: Missing way to specify a projection matrix, so our vertices in absolute coordinates are not displayed correctly in multi-viewports mode.
 
 // You can copy and use unmodified imgui_impl_* files in your project. See examples/ folder for examples of using this.
 // Prefer including the entire imgui/ repository into your project (either as a copy or as a submodule), and only build the backends you need.
